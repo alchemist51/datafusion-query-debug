@@ -16,7 +16,8 @@ pub async fn register_parquet_table_listing(
     if shard_dirs.len() == 1 {
         let file_format = ParquetFormat::new();
         let listing_options = ListingOptions::new(Arc::new(file_format))
-            .with_file_extension(".parquet");
+            .with_file_extension(".parquet")
+            .with_collect_stat(true);
         
         ctx.register_listing_table(
             table_name,

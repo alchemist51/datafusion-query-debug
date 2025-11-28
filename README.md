@@ -32,6 +32,9 @@ cargo run -- -d /path/to/data -q "SELECT count(*) FROM hits" -n 5
 
 # Query flat directory structure (parquet files directly in folder)
 cargo run -- -d /path/to/flat/folder -q "SELECT * FROM hits LIMIT 10" --flat
+
+# Show query execution plans
+cargo run -- -d /path/to/data -q "SELECT * FROM hits" --explain-logical --explain-physical
 ```
 
 ## Options
@@ -42,6 +45,8 @@ cargo run -- -d /path/to/flat/folder -q "SELECT * FROM hits LIMIT 10" --flat
 - `-o, --output-format <FORMAT>`: Output format (table, json, csv)
 - `-n, --num-runs <N>`: Number of times to run the query (default: 1)
 - `-f, --flat`: Use flat directory structure (parquet files directly in folder)
+- `--explain-logical`: Show logical query plan
+- `--explain-physical`: Show physical query plan
 - `-v, --verbose`: Enable verbose logging
 
 ## License

@@ -39,6 +39,14 @@ struct Args {
     /// Use flat directory structure (parquet files directly in folder)
     #[arg(short = 'f', long)]
     flat: bool,
+
+    /// Show logical plan
+    #[arg(long)]
+    explain_logical: bool,
+
+    /// Show physical plan
+    #[arg(long)]
+    explain_physical: bool,
 }
 
 #[tokio::main]
@@ -73,7 +81,12 @@ async fn main() -> Result<()> {
         println!("\n--- Run {}/{} ---", run, args.num_runs);
         
         let query_start = Instant::now();
-        let df = ctx.sql(&args.query).await?;
+        let mut df = ctx.sql(&args.query).await?;
+        
+        if args.explain_logical || args.explain_physical {
+            df = df.explain(args.explain_logical, args.explain_physical)?;
+        }
+        
         let results = df.collect().await?;
         let query_duration = query_start.elapsed();
         

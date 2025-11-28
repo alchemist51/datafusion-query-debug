@@ -26,6 +26,12 @@ cargo run -- -d /path/to/data -q "SELECT count(*) FROM hits" -v
 
 # Specify target partitions
 cargo run -- -d /path/to/data -q "SELECT * FROM hits" -t 8
+
+# Run query multiple times for benchmarking
+cargo run -- -d /path/to/data -q "SELECT count(*) FROM hits" -n 5
+
+# Query flat directory structure (parquet files directly in folder)
+cargo run -- -d /path/to/flat/folder -q "SELECT * FROM hits LIMIT 10" --flat
 ```
 
 ## Options
@@ -34,6 +40,8 @@ cargo run -- -d /path/to/data -q "SELECT * FROM hits" -t 8
 - `-q, --query <SQL>`: SQL query to execute
 - `-t, --target-partitions <N>`: Number of target partitions
 - `-o, --output-format <FORMAT>`: Output format (table, json, csv)
+- `-n, --num-runs <N>`: Number of times to run the query (default: 1)
+- `-f, --flat`: Use flat directory structure (parquet files directly in folder)
 - `-v, --verbose`: Enable verbose logging
 
 ## License

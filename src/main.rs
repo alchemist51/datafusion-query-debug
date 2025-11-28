@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::ListingOptions;
+use datafusion::execution::cache::cache_manager::CacheManagerConfig;
+use datafusion::execution::cache::cache_unit::DefaultFileStatisticsCache;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::*;
-use log::info;
+use log::{error, info};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -54,11 +58,11 @@ fn print_memory_stats() {
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the data directory containing shards
-    #[arg(short, long, default_value = "/home/ec2-user/benchsetup/OpenSearch/build/distribution/local/opensearch-3.3.0-SNAPSHOT/data")]
+    #[arg(short, long, default_value = "/Users/abandeji/Public/work-dump/clickbench_data/datafusion_3shards/data")]
     data_path: String,
 
     /// SQL query to execute
-    #[arg(short, long, default_value = "SELECT sum('UserID') FROM clickbench")]
+    #[arg(short, long, default_value = "SELECT COUNT(*) FROM hits")]
     query: String,
 
     /// Number of target partitions (should match number of shards)
@@ -72,6 +76,14 @@ struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Number of times to run the query
+    #[arg(short, long, default_value = "1")]
+    num_runs: usize,
+
+    /// Use flat directory structure (parquet files directly in folder)
+    #[arg(short = 'f', long)]
+    flat: bool,
 }
 
 #[tokio::main]
@@ -95,114 +107,91 @@ async fn main() -> Result<()> {
     info!("Data path: {}", args.data_path);
     info!("Query: {}", args.query);
 
-    // Discover shards and parquet files
-    let parquet_files = discover_parquet_files(&args.data_path).await?;
-    info!("Found {} parquet files across shards", parquet_files.len());
+    // Discover shard directories or use flat path
+    let shard_dirs = if args.flat {
+        vec![args.data_path.clone()]
+    } else {
+        discover_shard_directories(&args.data_path).await?
+    };
+    info!("Found {} shard directories", shard_dirs.len());
 
     // Determine target partitions
     let target_partitions = args.target_partitions.unwrap_or_else(|| {
-        let shard_count = count_shards(&args.data_path).unwrap_or(8);
-        info!("Auto-detected {} shards, setting target_partitions to {}", shard_count, shard_count);
+        let shard_count = shard_dirs.len();
+        info!("Setting target_partitions to {}", shard_count);
         shard_count
     });
 
     // Create DataFusion context
     let ctx = create_datafusion_context(target_partitions).await?;
 
+    // Register the parquet files as a table using listing table
+    register_parquet_table_listing(&ctx, &shard_dirs, "hits").await?;
 
-    // Register the parquet files as a table
-    register_parquet_table(&ctx, &parquet_files, "hits").await?;
-
-    // Execute the query
-    let query_start = Instant::now();
-    let df = ctx.sql(&args.query).await?;
-    let results = df.collect().await?;
-    let query_duration = query_start.elapsed();
-
-    // Output results
-    match args.output_format.as_str() {
-        "json" => output_json(&results)?,
-        "csv" => output_csv(&results)?,
-        _ => output_table(&results)?,
+    // Execute the query multiple times
+    for run in 1..=args.num_runs {
+        println!("\n--- Run {}/{} ---", run, args.num_runs);
+        
+        let query_start = Instant::now();
+        let df = ctx.sql(&args.query).await?;
+        let results = df.collect().await?;
+        let query_duration = query_start.elapsed();
+        
+        // Output results
+        match args.output_format.as_str() {
+            "json" => output_json(&results)?,
+            "csv" => output_csv(&results)?,
+            _ => output_table(&results)?,
+        }
+        
+        println!("\nQuery execution time: {:?}", query_duration);
+        println!("Rows returned: {}", results.iter().map(|batch| batch.num_rows()).sum::<usize>());
+        println!("Target partitions: {}", target_partitions);
+        print_memory_stats();
     }
 
     let total_duration = start_time.elapsed();
-    
-    println!("\n--- Performance Summary ---");
-    println!("Query execution time: {:?}", query_duration);
+    println!("\n--- Total Summary ---");
     println!("Total time: {:?}", total_duration);
-    println!("Rows returned: {}", results.iter().map(|batch| batch.num_rows()).sum::<usize>());
-    println!("Target partitions: {}", target_partitions);
-    print_memory_stats();
+    println!("Total runs: {}", args.num_runs);
 
     Ok(())
 }
 
-async fn discover_parquet_files(data_path: &str) -> Result<Vec<String>> {
-    let mut parquet_files = Vec::new();
+async fn discover_shard_directories(data_path: &str) -> Result<Vec<String>> {
+    let mut shard_dirs = Vec::new();
     let index_entry = Path::new(data_path);
 
     let mut shards_dir = fs::read_dir(index_entry).await?;
     while let Some(shard_entry) = shards_dir.next_entry().await? {
         if shard_entry.file_type().await?.is_dir() {
-            // Look for parquet files in this shard
             let shard_path = shard_entry.path();
+            // Check if this directory contains parquet files
+            let mut has_parquet = false;
             let mut shard_dir = fs::read_dir(&shard_path).await?;
             while let Some(file_entry) = shard_dir.next_entry().await? {
-                let file_name = file_entry.file_name();
-                if let Some(name_str) = file_name.to_str() {
+                if let Some(name_str) = file_entry.file_name().to_str() {
                     if name_str.ends_with(".parquet") {
-                        let full_path = file_entry.path();
-                        parquet_files.push(full_path.to_string_lossy().to_string());
-                        info!("Found parquet file: {}", full_path.display());
+                        has_parquet = true;
+                        break;
                     }
                 }
+            }
+            if has_parquet {
+                shard_dirs.push(shard_path.to_string_lossy().to_string());
+                info!("Found shard directory: {}", shard_path.display());
             }
         }
     }
 
-    if parquet_files.is_empty() {
-        return Err(anyhow::anyhow!("No parquet files found in: {}", data_path));
+    if shard_dirs.is_empty() {
+        return Err(anyhow::anyhow!("No shard directories with parquet files found in: {}", data_path));
     }
 
-    Ok(parquet_files)
+    Ok(shard_dirs)
 }
 
-fn count_shards(data_path: &str) -> Result<usize> {
-    let data_dir = Path::new(data_path);
-    let nodes_path = data_dir.join("nodes");
-    
-    if !nodes_path.exists() {
-        return Ok(8); // Default fallback
-    }
 
-    let mut shard_count = 0;
-    
-    // This is a simplified count - in practice you'd want to traverse the full structure
-    // For now, we'll use a heuristic based on the typical OpenSearch structure
-    if let Ok(entries) = std::fs::read_dir(&nodes_path) {
-        for node_entry in entries.flatten() {
-            if node_entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                let indices_path = node_entry.path().join("indices");
-                if let Ok(index_entries) = std::fs::read_dir(&indices_path) {
-                    for index_entry in index_entries.flatten() {
-                        if index_entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                            if let Ok(shard_entries) = std::fs::read_dir(&index_entry.path()) {
-                                for shard_entry in shard_entries.flatten() {
-                                    if shard_entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                                        shard_count += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(if shard_count > 0 { shard_count } else { 8 })
-}
 
 async fn create_datafusion_context(target_partitions: usize) -> Result<SessionContext> {
     let config = SessionConfig::new()
@@ -210,6 +199,7 @@ async fn create_datafusion_context(target_partitions: usize) -> Result<SessionCo
         .with_batch_size(8192);
 
     let runtime = RuntimeEnvBuilder::new()
+        .with_cache_manager(CacheManagerConfig::default())
         //.with_memory_limit(2_000_000_000, 1.0) // 2GB memory limit
         .build()?;
     
@@ -219,30 +209,46 @@ async fn create_datafusion_context(target_partitions: usize) -> Result<SessionCo
     Ok(ctx)
 }
 
-async fn register_parquet_table(
+async fn register_parquet_table_listing(
     ctx: &SessionContext,
-    parquet_files: &[String],
+    shard_dirs: &[String],
     table_name: &str,
 ) -> Result<()> {
-    info!("Registering {} parquet files as table '{}'", parquet_files.len(), table_name);
-
-    // Use read_parquet to register all files at once
-    let df = ctx.read_parquet(parquet_files[0].clone(), ParquetReadOptions::default()).await?;
+    use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
     
-    // If there are multiple files, union them
-    if parquet_files.len() > 1 {
-        let mut combined_df = df;
-        for file_path in &parquet_files[1..] {
-            let next_df = ctx.read_parquet(file_path.clone(), ParquetReadOptions::default()).await?;
-            combined_df = combined_df.union(next_df)?;
-        }
+    info!("Registering {} shard directories as table '{}' using listing table", shard_dirs.len(), table_name);
 
-        ctx.register_table(table_name, combined_df.into_view())?;
-    } else {
-        ctx.register_table(table_name, df.into_view())?;
+    let mut tables = Vec::new();
+    
+    // Create tables with inferred schema
+    for shard_dir in shard_dirs {
+        let table_path = ListingTableUrl::parse(&shard_dir)?;
+        let file_format = ParquetFormat::new();
+        let listing_options = ListingOptions::new(Arc::new(file_format))
+            .with_file_extension(".parquet");
+
+        let resolved_schema = listing_options
+            .infer_schema(&ctx.state(), &table_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to infer schema: {}", e))?;
+
+        let table_config = ListingTableConfig::new(table_path.clone())
+            .with_listing_options(listing_options)
+            .with_schema(resolved_schema);
+
+        let table = ListingTable::try_new(table_config)?;
+        tables.push(ctx.read_table(Arc::new(table))?);
     }
-
-    info!("Successfully registered table '{}'", table_name);
+    
+    // Union all shard tables
+    let mut combined_df = tables[0].clone();
+    for table in &tables[1..] {
+        combined_df = combined_df.union(table.clone())?;
+    }
+    
+    ctx.register_table(table_name, combined_df.into_view())?;
+    info!("Successfully registered listing table '{}'", table_name);
     Ok(())
 }
 
